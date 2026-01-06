@@ -42,16 +42,25 @@ def process_excel(file):
         wb = openpyxl.load_workbook(file)
         sheet_names = wb.sheetnames
         
-        # 尋找最新的 "未開單" 分頁
-        pattern = r"\(說明\) 領用明細_(\d+) \(未開單\)"
-        matches = [(re.search(pattern, s).group(1), s) for s in sheet_names if re.search(pattern, s)]
+        # 修改後的正則表達式：
+        # .* 表示允許前方有任何文字（例如：(說明)、(緊急)）
+        # \d+ 匹配日期數字
+        # \(未開單\) 匹配結尾
+        pattern = r".*領用明細_(\d+).*\(未開單\)"
+        matches = []
+        for s in sheet_names:
+            m = re.search(pattern, s)
+            if m:
+                # 提取日期數字用於排序，並記錄完整分頁名稱
+                matches.append((m.group(1), s))
         
         if not matches:
-            st.error("找不到符合格式的『(說明) 領用明細_日期 (未開單)』分頁！")
+            st.error("找不到符合格式的分頁！請確保分頁名稱包含『領用明細_日期』且結尾為『(未開單)』")
             return None, None
         
+        # 排序以取得最新日期的分頁
         latest_date, target_sheet_name = sorted(matches, key=lambda x: x[0])[-1]
-        st.info(f"正在處理明細分頁：{target_sheet_name}")
+        st.info(f"📍 偵測到目標分頁：{target_sheet_name}")
         
         # 2. 讀取資料對照表
         detail_df = pd.read_excel(file, sheet_name=target_sheet_name, header=1)
