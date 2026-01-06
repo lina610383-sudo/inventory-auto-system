@@ -9,17 +9,33 @@ import re
 st.set_page_config(page_title="領用單自動化生成系統", layout="wide")
 st.title("🚀 領用單流程自動化系統")
 
-def get_col_idx_by_id(ws, header_row_idx, target_id):
+def get_col_idx_by_header(ws, header_row_idx, target_header_name):
     """
-    在模板標題列搜尋工號（掛帳人 ID），返回欄位索引 (1-based)
+    動態偵測：在指定的標題列搜尋對應名稱的欄位索引 (1-based)
+    支援多種可能標題的模糊匹配
     """
-    if not target_id: 
+    if not target_header_name:
         return None
-    target_id = str(target_id).strip().upper()
+    
+    # 定義常見的標題同義詞
+    synonyms = {
+        "Vendor": ["VENDOR", "SUPPLIER", "廠商"],
+        "Description": ["DESCRIPTION", "品名", "描述"],
+        "HP PN": ["HP PN", "HPPN", "HP料號"],
+        "IEC PN": ["IEC PN", "IECPN", "IEC料號"],
+        "Unit": ["UNIT", "單位"],
+        "No": ["NO", "NO.", "項次", "序號"]
+    }
+    
+    search_list = synonyms.get(target_header_name, [target_header_name])
+    search_list = [s.upper() for s in search_list]
+
     for col in range(1, ws.max_column + 1):
         val = ws.cell(row=header_row_idx, column=col).value
-        if val and str(val).strip().upper() == target_id:
-            return col
+        if val:
+            cell_text = str(val).strip().upper()
+            if any(s in cell_text for s in search_list):
+                return col
     return None
 
 def process_excel(file):
@@ -44,7 +60,6 @@ def process_excel(file):
         st.info(f"📍 偵測到目標明細分頁：{target_sheet_name}")
         
         # 2. 讀取資料
-        # header=1 假設明細標題在第 2 列
         detail_df = pd.read_excel(file, sheet_name=target_sheet_name, header=1)
         
         if "掛帳人清單" not in sheet_names:
@@ -66,97 +81,98 @@ def process_excel(file):
 
         # 3. 準備產出分頁
         output_ws_dict = {}
-        current_row_dict = {} # 紀錄每個模板目前寫到哪一行
+        current_row_dict = {} 
         for t in ['IEC', 'ICC']:
             tmpl_name = f"領用單格式範例 {t}"
             if tmpl_name in sheet_names:
                 new_ws = wb.copy_worksheet(wb[tmpl_name])
                 new_ws.title = f"{t}_領用單_{latest_date}"
                 output_ws_dict[t] = new_ws
-                current_row_dict[t] = 6 # 假設模板從第 6 行開始填寫資料
+                current_row_dict[t] = 6 # 資料填寫起始行
             else:
                 st.warning(f"⚠️ 檔案中缺少模板：『{tmpl_name}』")
 
-        # 4. 定位與回填 (從未開單分頁抓取料件資訊並填入模板)
+        # 4. 定位與回填
         valid_person_cols = [c for c in detail_df.columns if str(c).strip() in payer_map]
         filled_count = 0
 
-        # 定義料件資訊回填至模板的欄位索引 (1-based)
-        # 您可以根據實際模板結構調整
-        item_mapping = {
-            'Description': 2,   # B 欄
-            'Supplier': 3,      # C 欄
-            'Unit': 4,          # D 欄
-            'IEC PN': 5,        # E 欄 (料號)
-            'Unit Price': 6     # F 欄
-        }
+        # 需要從明細中提取的關鍵欄位名稱
+        fields_to_sync = ["No", "Vendor", "Description", "HP PN", "IEC PN", "Unit"]
 
-        for _, row in detail_df.iterrows():
+        for index, row in detail_df.iterrows():
             item_pn = row.get('IEC PN')
             if pd.isna(item_pn): continue
             
-            # 檢查這列中是否有任何 IEC 或 ICC 的領用需求
-            has_qty_iec = False
-            has_qty_icc = False
-            
-            # 先掃描一次這列資料，確認哪些單位需要開單
+            unit_targets = set()
             for person in valid_person_cols:
                 qty = row[person]
                 if pd.notna(qty) and isinstance(qty, (int, float)) and qty > 0:
-                    unit_type = payer_map[str(person).strip()]['type']
-                    if unit_type == "IEC": has_qty_iec = True
-                    if unit_type == "ICC": has_qty_icc = True
+                    unit_targets.add(payer_map[str(person).strip()]['type'])
 
-            # 針對需要的單位模板，填入料件基本資訊與數量
-            for t in ['IEC', 'ICC']:
-                if (t == "IEC" and has_qty_iec) or (t == "ICC" and has_qty_icc):
-                    if t in output_ws_dict:
-                        ws = output_ws_dict[t]
-                        target_row = current_row_dict[t]
+            for t in unit_targets:
+                if t in output_ws_dict:
+                    ws = output_ws_dict[t]
+                    target_row = current_row_dict[t]
+                    
+                    # 自動偵測模板欄位位置並填入資料
+                    for field in fields_to_sync:
+                        col_idx = get_col_idx_by_header(ws, 5, field)
+                        if col_idx:
+                            if field == "No":
+                                ws.cell(row=target_row, column=col_idx, value=target_row - 5)
+                            else:
+                                # 處理明細表中可能不同名的欄位 (如 Vendor vs Supplier)
+                                source_val = row.get(field)
+                                if pd.isna(source_val) and field == "Vendor":
+                                    source_val = row.get("Supplier")
+                                
+                                if pd.notna(source_val):
+                                    ws.cell(row=target_row, column=col_idx, value=source_val)
+                    
+                    # 回填領用數量 (掛帳人對位)
+                    for person in valid_person_cols:
+                        person_name = str(person).strip()
+                        info = payer_map[person_name]
                         
-                        # 1. 填入料件基本資料 (從未開單分頁抓取)
-                        for col_name, col_idx in item_mapping.items():
-                            if col_name in row:
-                                ws.cell(row=target_row, column=col_idx, value=row[col_name])
-                        
-                        # 2. 橫向對位填入該人的領用數量
-                        for person in valid_person_cols:
-                            person_name = str(person).strip()
-                            info = payer_map[person_name]
-                            
-                            if info['type'] == t:
-                                qty = row[person]
-                                if pd.notna(qty) and isinstance(qty, (int, float)) and qty > 0:
-                                    # 搜尋工號在第 5 列的欄位座標
-                                    target_col = get_col_idx_by_id(ws, 5, info['id'])
-                                    if target_col:
-                                        ws.cell(row=target_row, column=target_col, value=qty)
-                                        filled_count += 1
-                        
-                        # 完成這列填寫後，模板行數下移一行
-                        current_row_dict[t] += 1
+                        if info['type'] == t:
+                            qty = row[person]
+                            if pd.notna(qty) and isinstance(qty, (int, float)) and qty > 0:
+                                # 動態搜尋工號所在欄位
+                                target_col = None
+                                target_id = info['id']
+                                for col in range(1, ws.max_column + 1):
+                                    header_val = ws.cell(row=5, column=col).value
+                                    if header_val and str(header_val).strip().upper() == str(target_id).upper():
+                                        target_col = col
+                                        break
+                                
+                                if target_col:
+                                    ws.cell(row=target_row, column=target_col, value=qty)
+                                    filled_count += 1
+                    
+                    current_row_dict[t] += 1
 
         # 5. 輸出
         ws_orig = wb[target_sheet_name]
         ws_orig.title = target_sheet_name.replace("(未開單)", "(已開單)")
         
         if filled_count > 0:
-            st.success(f"✅ 成功從未開單分頁提取料件資訊，並填入 {filled_count} 筆領用數量。")
+            st.success(f"✅ 已完成動態對位回填。已偵測並同步：Vendor, Description, HP PN, IEC PN, Unit。")
         else:
-            st.warning("⚠️ 掃描完成，但未發現有效的領用數量（需大於 0）。")
+            st.warning("⚠️ 處理完成，但未發現有效的領用資料。")
 
         output = io.BytesIO()
         wb.save(output)
         return output.getvalue(), latest_date
 
     except Exception as e:
-        st.error(f"❌ 錯誤：{str(e)}")
+        st.error(f"❌ 發生錯誤：{str(e)}")
         return None, None
 
-# 使用者介面
-uploaded_file = st.file_uploader("📂 請上傳 Excel 檔案", type=["xlsx"])
+# UI
+uploaded_file = st.file_uploader("📂 請上傳領用單 Excel 檔案", type=["xlsx"])
 if uploaded_file:
-    if st.button("✨ 執行自動化回填"):
+    if st.button("✨ 執行智慧動態生成"):
         processed_data, date = process_excel(uploaded_file)
         if processed_data:
-            st.download_button("📥 下載結果", data=processed_data, file_name=f"領用單_{date}.xlsx")
+            st.download_button("📥 下載領用單結果", data=processed_data, file_name=f"領用單產出_{date}.xlsx")
