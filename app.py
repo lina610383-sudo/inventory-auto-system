@@ -12,14 +12,15 @@ st.title("🚀 領用單流程自動化系統 (含領用人資訊填寫)")
 def get_col_idx_by_header(ws, header_row_idx, target_field_key):
     """
     動態偵測：根據預設的關鍵字組，在指定標題列搜尋對應的欄位索引 (1-based)
+    針對「名詞差異」進行強化模糊匹配
     """
     synonyms = {
-        "Vendor": ["VENDOR", "SUPPLIER", "廠商", "供應商"],
-        "Description": ["DESCRIPTION", "品名", "描述", "零件名稱"],
-        "HP PN": ["HP PN", "HPPN", "HP料號", "CUSTOMER PN"],
-        "IEC PN": ["IEC PN", "IECPN", "IEC料號", "INTERNAL PN"],
-        "Unit": ["UNIT", "單位"],
-        "No": ["NO", "NO.", "項次", "序號"]
+        "Vendor": ["VENDOR", "SUPPLIER", "廠商", "供應商", "MFR", "Manufacturer"],
+        "Description": ["DESCRIPTION", "品名", "描述", "零件名稱", "SPEC", "規格"],
+        "HP PN": ["HP PN", "HPPN", "HP料號", "CUSTOMER PN", "客戶料號"],
+        "IEC PN": ["IEC PN", "IECPN", "IEC料號", "INTERNAL PN", "內部料號", "料號"],
+        "Unit": ["UNIT", "單位", "UOM"],
+        "No": ["NO", "NO.", "項次", "序號", "INDEX"]
     }
     
     search_keywords = synonyms.get(target_field_key, [target_field_key])
@@ -28,32 +29,55 @@ def get_col_idx_by_header(ws, header_row_idx, target_field_key):
         val = ws.cell(row=header_row_idx, column=col).value
         if val:
             cell_text = str(val).strip().upper()
+            # 1. 優先完全匹配
             if any(k.upper() == cell_text for k in search_keywords):
                 return col
+            # 2. 包含匹配 (處理標題帶有空格或括號的情況)
             if any(k.upper() in cell_text for k in search_keywords):
                 return col
     return None
 
 def fill_personnel_info(ws, personnel_data):
     """
-    在模板中搜尋「領用人」、「工號」等關鍵字，並在該儲存格右方或指定位置填入資料
+    在模板中搜尋「領用人」、「工號」、「部門」等標籤，並在對應位置填寫
     """
-    # 定義要搜尋的標籤
     tags = {
         "領用人": personnel_data.get('name', ''),
+        "姓名": personnel_data.get('name', ''),
         "工號": personnel_data.get('id', ''),
+        "員工編號": personnel_data.get('id', ''),
         "部門": personnel_data.get('dept', '')
     }
     
-    # 掃描前 10 列 (通常資訊在上方)
+    # 掃描前 10 列尋找表頭資訊標籤
     for r in range(1, 10):
         for c in range(1, ws.max_column + 1):
             cell_val = ws.cell(row=r, column=c).value
             if cell_val and isinstance(cell_val, str):
                 for tag, value in tags.items():
                     if tag in cell_val:
-                        # 假設資料填在標籤的右邊一格 (c+1)
-                        ws.cell(row=r, column=c+1, value=value)
+                        # 檢查右側或下方是否有空白格可填入
+                        if not ws.cell(row=r, column=c+1).value:
+                            ws.cell(row=r, column=c+1, value=value)
+                        break
+
+def get_source_data(row, field_key):
+    """
+    根據關鍵字從 DataFrame 的 Row 中抓取資料，解決資料源 A 表的命名差異
+    """
+    source_synonyms = {
+        "Vendor": ["Vendor", "Supplier", "廠商", "供應商"],
+        "Description": ["Description", "品名", "描述", "零件名稱", "Description/品名"],
+        "HP PN": ["HP PN", "HPPN", "Customer PN", "客戶料號"],
+        "IEC PN": ["IEC PN", "IECPN", "Internal PN", "內部料號", "料號"],
+        "Unit": ["Unit", "單位"]
+    }
+    
+    potential_keys = source_synonyms.get(field_key, [field_key])
+    for k in potential_keys:
+        if k in row and pd.notna(row[k]):
+            return row[k]
+    return ""
 
 def process_excel(file):
     try:
@@ -95,7 +119,7 @@ def process_excel(file):
                     'type': "IEC" if "IEC" in unit_type else "ICC",
                     'id': str(row['掛帳人']).strip(),
                     'name': name,
-                    'dept': str(row.get('部門', '')).strip() # 假設有部門欄位
+                    'dept': str(row.get('部門', '')).strip()
                 }
 
         # 3. 準備產出分頁
@@ -116,12 +140,11 @@ def process_excel(file):
         filled_count = 0
         fields_to_sync = ["No", "Vendor", "Description", "HP PN", "IEC PN", "Unit"]
 
-        # 用於追蹤每個模板是否已經填過人員資訊
         personnel_filled = {"IEC": False, "ICC": False}
 
         for index, row in detail_df.iterrows():
-            item_pn = row.get('IEC PN')
-            if pd.isna(item_pn): continue
+            item_pn = get_source_data(row, 'IEC PN')
+            if not item_pn: continue
             
             unit_targets = set()
             for person in valid_person_cols:
@@ -134,23 +157,24 @@ def process_excel(file):
                     ws = output_ws_dict[t]
                     target_row = current_row_dict[t]
                     
-                    # A. 填入人員資訊 (僅需填寫一次)
+                    # A. 填入人員資訊
                     if not personnel_filled[t]:
-                        # 找到該單位的第一位領用人資料填寫
-                        first_person = next(p for p in valid_person_cols if payer_map[str(p).strip()]['type'] == t)
-                        fill_personnel_info(ws, payer_map[str(first_person).strip()])
-                        personnel_filled[t] = True
+                        try:
+                            first_person = next(p for p in valid_person_cols if payer_map[str(p).strip()]['type'] == t)
+                            fill_personnel_info(ws, payer_map[str(first_person).strip()])
+                            personnel_filled[t] = True
+                        except StopIteration:
+                            pass
 
-                    # B. 填入料件基本資訊
+                    # B. 填入料件基本資訊 (自動適應 A 表與 B 表名詞差異)
                     for field in fields_to_sync:
                         col_idx = get_col_idx_by_header(ws, 5, field)
                         if col_idx:
                             if field == "No":
                                 ws.cell(row=target_row, column=col_idx, value=target_row - 5)
                             else:
-                                val = row.get(field)
-                                if pd.isna(val) and field == "Vendor": val = row.get("Supplier")
-                                if pd.notna(val):
+                                val = get_source_data(row, field)
+                                if val:
                                     ws.cell(row=target_row, column=col_idx, value=val)
                     
                     # C. 填入領用數量 (掛帳人工號對位)
@@ -162,7 +186,6 @@ def process_excel(file):
                             if pd.notna(qty) and isinstance(qty, (int, float)) and qty > 0:
                                 target_col = None
                                 target_id = str(info['id']).strip().upper()
-                                # 在第 5 列標題列找工號
                                 for c in range(1, ws.max_column + 1):
                                     h_val = ws.cell(row=5, column=c).value
                                     if h_val and str(h_val).strip().upper() == target_id:
@@ -179,9 +202,9 @@ def process_excel(file):
         ws_orig.title = target_sheet_name.replace("(未開單)", "(已開單)")
         
         if filled_count > 0:
-            st.success(f"✅ 完成！已同步料件資訊、領用數量及人員基本資料。")
+            st.success(f"✅ 完成！已處理名詞差異並同步資料。")
         else:
-            st.warning("⚠️ 處理完成，但未發現有效的領用資料。")
+            st.warning("⚠️ 處理完成，但未發現有效的領用數量。")
 
         output = io.BytesIO()
         wb.save(output)
