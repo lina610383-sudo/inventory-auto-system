@@ -22,19 +22,6 @@ def get_col_idx_by_id(ws, header_row_idx, target_id):
             return col
     return None
 
-def get_row_idx_by_pn(ws, pn_col_idx, target_pn):
-    """
-    在模板料號欄搜尋 PN，返回行索引 (1-based)
-    """
-    if not target_pn: 
-        return None
-    target_pn = str(target_pn).strip().upper()
-    for row in range(1, ws.max_row + 1):
-        val = ws.cell(row=row, column=pn_col_idx).value
-        if val and str(val).strip().upper() == target_pn:
-            return row
-    return None
-
 def process_excel(file):
     try:
         # 1. 載入原始活頁簿
@@ -79,76 +66,84 @@ def process_excel(file):
 
         # 3. 準備產出分頁
         output_ws_dict = {}
+        current_row_dict = {} # 紀錄每個模板目前寫到哪一行
         for t in ['IEC', 'ICC']:
             tmpl_name = f"領用單格式範例 {t}"
             if tmpl_name in sheet_names:
                 new_ws = wb.copy_worksheet(wb[tmpl_name])
                 new_ws.title = f"{t}_領用單_{latest_date}"
                 output_ws_dict[t] = new_ws
+                current_row_dict[t] = 6 # 假設模板從第 6 行開始填寫資料
             else:
                 st.warning(f"⚠️ 檔案中缺少模板：『{tmpl_name}』")
 
-        # 4. 定位與回填 (含料件資料同步)
+        # 4. 定位與回填 (從未開單分頁抓取料件資訊並填入模板)
         valid_person_cols = [c for c in detail_df.columns if str(c).strip() in payer_map]
-        missing_data = []
         filled_count = 0
 
-        # 定義料件資訊欄位與模板對應欄位的映射 (範例：明細標題 -> 模板列索引)
-        # 您可以根據實際 Excel 欄位調整這裡的數字
-        item_info_mapping = {
-            'Description': 2,   # 假設模板 B 欄是 Description
-            'Supplier': 3,      # 假設模板 C 欄是 Supplier
-            'Unit': 4,          # 假設模板 D 欄是 Unit
-            'Unit Price': 6     # 假設模板 F 欄是 Unit Price
+        # 定義料件資訊回填至模板的欄位索引 (1-based)
+        # 您可以根據實際模板結構調整
+        item_mapping = {
+            'Description': 2,   # B 欄
+            'Supplier': 3,      # C 欄
+            'Unit': 4,          # D 欄
+            'IEC PN': 5,        # E 欄 (料號)
+            'Unit Price': 6     # F 欄
         }
 
         for _, row in detail_df.iterrows():
             item_pn = row.get('IEC PN')
             if pd.isna(item_pn): continue
             
+            # 檢查這列中是否有任何 IEC 或 ICC 的領用需求
+            has_qty_iec = False
+            has_qty_icc = False
+            
+            # 先掃描一次這列資料，確認哪些單位需要開單
             for person in valid_person_cols:
                 qty = row[person]
-                
                 if pd.notna(qty) and isinstance(qty, (int, float)) and qty > 0:
-                    person_name = str(person).strip()
-                    info = payer_map[person_name]
-                    target_type = info['type']
-                    
-                    if target_type in output_ws_dict:
-                        ws = output_ws_dict[target_type]
+                    unit_type = payer_map[str(person).strip()]['type']
+                    if unit_type == "IEC": has_qty_iec = True
+                    if unit_type == "ICC": has_qty_icc = True
+
+            # 針對需要的單位模板，填入料件基本資訊與數量
+            for t in ['IEC', 'ICC']:
+                if (t == "IEC" and has_qty_iec) or (t == "ICC" and has_qty_icc):
+                    if t in output_ws_dict:
+                        ws = output_ws_dict[t]
+                        target_row = current_row_dict[t]
                         
-                        # 定位座標
-                        target_row = get_row_idx_by_pn(ws, 5, item_pn) # PN 在 E 欄 (5)
-                        target_col = get_col_idx_by_id(ws, 5, info['id']) # 工號在 第 5 列
+                        # 1. 填入料件基本資料 (從未開單分頁抓取)
+                        for col_name, col_idx in item_mapping.items():
+                            if col_name in row:
+                                ws.cell(row=target_row, column=col_idx, value=row[col_name])
                         
-                        if target_row and target_col:
-                            # 1. 回填數量
-                            ws.cell(row=target_row, column=target_col, value=qty)
+                        # 2. 橫向對位填入該人的領用數量
+                        for person in valid_person_cols:
+                            person_name = str(person).strip()
+                            info = payer_map[person_name]
                             
-                            # 2. 同步回填料件詳細資料 (從明細表填入模板對應列)
-                            for detail_col_name, tmpl_col_idx in item_info_mapping.items():
-                                if detail_col_name in row:
-                                    ws.cell(row=target_row, column=tmpl_col_idx, value=row[detail_col_name])
-                            
-                            filled_count += 1
-                        else:
-                            reason = []
-                            if not target_row: reason.append(f"料號 {item_pn} 不在模板 E 欄")
-                            if not target_col: reason.append(f"工號 {info['id']} 不在模板第 5 列標題")
-                            missing_data.append({
-                                "類型": target_type, "領用人": person_name, "料號": item_pn, "原因": " & ".join(reason)
-                            })
+                            if info['type'] == t:
+                                qty = row[person]
+                                if pd.notna(qty) and isinstance(qty, (int, float)) and qty > 0:
+                                    # 搜尋工號在第 5 列的欄位座標
+                                    target_col = get_col_idx_by_id(ws, 5, info['id'])
+                                    if target_col:
+                                        ws.cell(row=target_row, column=target_col, value=qty)
+                                        filled_count += 1
+                        
+                        # 完成這列填寫後，模板行數下移一行
+                        current_row_dict[t] += 1
 
         # 5. 輸出
         ws_orig = wb[target_sheet_name]
         ws_orig.title = target_sheet_name.replace("(未開單)", "(已開單)")
         
-        if missing_data:
-            st.warning("📋 部分資料定位失敗，請檢查模板設定：")
-            st.table(pd.DataFrame(missing_data))
-        
         if filled_count > 0:
-            st.success(f"✅ 成功填入 {filled_count} 筆領用資料及其詳細料件資訊。")
+            st.success(f"✅ 成功從未開單分頁提取料件資訊，並填入 {filled_count} 筆領用數量。")
+        else:
+            st.warning("⚠️ 掃描完成，但未發現有效的領用數量（需大於 0）。")
 
         output = io.BytesIO()
         wb.save(output)
