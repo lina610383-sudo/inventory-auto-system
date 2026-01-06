@@ -1,0 +1,157 @@
+import streamlit as st
+import pandas as pd
+import re
+import io
+from openpyxl import load_workbook
+from openpyxl.utils import get_column_letter
+from copy import copy
+
+# 設定頁面資訊
+st.set_page_config(page_title="領用單自動化系統", layout="wide")
+st.title("📦 領用單自動化生成系統")
+st.markdown("---")
+
+def get_col_idx_by_value(ws, row_idx, value):
+    """在指定列中搜尋特定值的欄位索引 (1-based)"""
+    for col in range(1, ws.max_column + 2):
+        cell_val = ws.cell(row=row_idx, column=col).value
+        if cell_val and str(cell_val).strip() == str(value).strip():
+            return col
+    return None
+
+def process_inventory(file):
+    # 1. 讀取 Excel 檔案結構
+    try:
+        wb = load_workbook(file)
+    except Exception as e:
+        st.error(f"檔案讀取失敗: {e}")
+        return None, None
+
+    # 2. 尋找最新的「未開單」分頁
+    sheet_names = wb.sheetnames
+    pattern = r"\(說明\) 領用明細_(\d+) \(未開單\)"
+    target_sheets = []
+    
+    for name in sheet_names:
+        match = re.search(pattern, name)
+        if match:
+            target_sheets.append((match.group(1), name))
+    
+    if not target_sheets:
+        st.error("找不到符合格式『(說明) 領用明細_日期 (未開單)』的分頁。")
+        return None, None
+    
+    # 排序取日期最大的
+    latest_date_str, source_sheet_name = sorted(target_sheets, key=lambda x: x[0])[-1]
+    st.success(f"📍 鎖定最新分頁：`{source_sheet_name}` (日期: {latest_date_str})")
+
+    # 3. 讀取資料
+    # 讀取掛帳人清單
+    if "掛帳人清單" not in sheet_names:
+        st.error("找不到『掛帳人清單』分頁！")
+        return None, None
+    
+    # 使用 pandas 讀取資料以方便處理
+    df_payers = pd.read_excel(file, sheet_name="掛帳人清單")
+    # 處理掛帳人清單：第一欄如果是類別 (IEC/ICC)，可能會有合併儲存格導致空值，需填補
+    df_payers.iloc[:, 0] = df_payers.iloc[:, 0].ffill()
+    
+    # 建立掛帳人對照字典: Name -> {ID, Unit, Type}
+    payer_map = {}
+    for _, row in df_payers.iterrows():
+        p_name = row.get('領用人')
+        if pd.notna(p_name):
+            clean_name = str(p_name).strip()
+            payer_map[clean_name] = {
+                'type': str(row.iloc[0]).strip() if pd.notna(row.iloc[0]) else 'IEC', 
+                'unit': str(row.get('單位')).strip(),
+                'id': str(row.get('掛帳人')).strip()
+            }
+
+    # 讀取明細分頁
+    df_detail = pd.read_excel(file, sheet_name=source_sheet_name, header=1) 
+    
+    # 4. 準備寫入 IEC 與 ICC 模板
+    template_iec_name = "領用單格式範例 IEC"
+    template_icc_name = "領用單格式範例 ICC"
+    
+    ws_iec = None
+    ws_icc = None
+    
+    if template_iec_name in wb.sheetnames:
+        ws_iec = wb.copy_worksheet(wb[template_iec_name])
+        ws_iec.title = f"IEC_Output_{latest_date_str}"
+    
+    if template_icc_name in wb.sheetnames:
+        ws_icc = wb.copy_worksheet(wb[template_icc_name])
+        ws_icc.title = f"ICC_Output_{latest_date_str}"
+
+    iec_header_row = 5
+    iec_start_row = 6
+    icc_header_row = 5
+    icc_start_row = 6
+
+    current_iec_row = iec_start_row
+    current_icc_row = icc_start_row
+
+    # 5. 逐行處理明細
+    person_columns = [col for col in df_detail.columns if str(col).strip() in payer_map]
+    
+    for idx, row in df_detail.iterrows():
+        desc = row.get('Description')
+        pn = row.get('IEC PN')
+        supplier = row.get('Supplier')
+        
+        desc_val = desc if pd.notna(desc) else "【須補資料】"
+        pn_val = pn if pd.notna(pn) else "【須補資料】"
+        supplier_val = supplier if pd.notna(supplier) else "【須補資料】"
+        
+        for person in person_columns:
+            qty = row[person]
+            if pd.notna(qty) and qty > 0:
+                p_info = payer_map.get(str(person).strip())
+                if not p_info: continue
+
+                p_id = p_info['id']
+                p_type = p_info['type']
+                
+                target_ws = None
+                if "IEC" in p_type.upper() and ws_iec:
+                    target_ws = ws_iec
+                    target_row = current_iec_row
+                    header_row = iec_header_row
+                    target_ws.cell(row=target_row, column=1, value=desc_val)
+                    target_ws.cell(row=target_row, column=2, value=supplier_val)
+                    target_ws.cell(row=target_row, column=5, value=pn_val)
+                    current_iec_row += 1
+                elif "ICC" in p_type.upper() and ws_icc:
+                    target_ws = ws_icc
+                    target_row = current_icc_row
+                    header_row = icc_header_row
+                    target_ws.cell(row=target_row, column=1, value=desc_val)
+                    target_ws.cell(row=target_row, column=5, value=pn_val)
+                    current_icc_row += 1
+                
+                if target_ws:
+                    col_idx = get_col_idx_by_value(target_ws, header_row, p_id)
+                    if not col_idx:
+                        col_idx = target_ws.max_column + 1
+                        target_ws.cell(row=header_row, column=col_idx, value=p_id)
+                    target_ws.cell(row=target_row, column=col_idx, value=qty)
+
+    # 6. 更新狀態分頁
+    if source_sheet_name in wb.sheetnames:
+        wb[source_sheet_name].title = f"(說明) 領用明細_{latest_date_str} (已開單)"
+
+    output = io.BytesIO()
+    wb.save(output)
+    output.seek(0)
+    return output, latest_date_str
+
+# 介面
+file_upload = st.file_uploader("📂 上傳領用單 Excel", type=["xlsx"])
+if file_upload:
+    if st.button("🚀 開始自動產出"):
+        processed_file, date_str = process_inventory(file_upload)
+        if processed_file:
+            st.download_button("📥 下載完成檔案", processed_file, f"領用單_{date_str}_已完成.xlsx")
